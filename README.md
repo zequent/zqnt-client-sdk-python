@@ -1,13 +1,14 @@
 # zqnt-client-sdk (Python)
 
-Python client SDK for the Zequent Framework. Provides an async interface over gRPC
-to the Remote Control, Mission Autonomy and Live Data services.
+Python client SDK for Zequent 3.0. Every asset is commanded the same way, by command id, through
+`client.commands`; live telemetry, detections and alerts come from `client.telemetry`;
+Applications, Skill executions and schedulers from `client.mission_autonomy` and
+`client.connector`.
 
 - Python 3.12+
 - Async-first (`asyncio` / `grpc.aio`)
 - Type hints throughout (`py.typed` marker shipped)
 - Built-in retry / circuit-breaker resilience
-- Strongly-typed request/response models
 
 ---
 
@@ -28,7 +29,7 @@ After installation you can verify the version:
 ```python
 import client_sdk
 
-print(client_sdk.__version__)  # "1.0.1"
+print(client_sdk.__version__)  # "3.0.0"
 ```
 
 ---
@@ -37,21 +38,15 @@ print(client_sdk.__version__)  # "1.0.1"
 
 ```python
 import asyncio
-from client_sdk import ZequentClient, TakeoffRequest
+from client_sdk import ZequentClient
 
 
 async def main():
     async with ZequentClient.from_env() as client:
-        # Remote Control
-        await client.remote_control.takeoff(TakeoffRequest(sn="DOCK-1"))
+        await client.commands.execute_command("DRONE-1", "flight.takeoff", {"altitude": 40})
 
-        # Mission Autonomy
-        task = await client.mission_autonomy.get_task("task-uuid")
-        print(task)
-
-        # Live Data (server-streaming)
-        async for telemetry in client.live_data.stream_telemetry(asset_sn="DOCK-1"):
-            print(telemetry)
+        async for item in client.telemetry.watch_telemetry(["DRONE-1"]):
+            print(item)
 
 
 asyncio.run(main())
@@ -91,74 +86,131 @@ async with ZequentClient(
 
 ---
 
-## Sub-clients
+## Commands
 
-The top-level `ZequentClient` exposes three sub-clients matching the underlying gRPC
-services. Each method maps 1:1 to the Java client SDK.
+Every asset is commanded the same way: list what it can do, then run a command by
+its dotted id with a dict of params. There are no typed methods per command.
 
-### `client.remote_control`
+```python
+from client_sdk import CommandError
+from client_sdk.commands import to_dict
 
-Flight, manual control, dock and asset operations.
+async with ZequentClient.from_env() as client:
+    capabilities = await client.commands.list_capabilities("DOCK-1")
+    for capability in capabilities.capabilities:
+        print(capability.command_id, capability.safety.risk, capability.input_schema)
 
-| Method                         | Purpose                                  |
-| ------------------------------ | ---------------------------------------- |
-| `takeoff(req)`                 | Launch an asset                          |
-| `go_to(req, *, no_fly_zone_override=False)` | Fly-to; the override (org admin / system admin only) flies through a no-fly zone that would refuse it |
-| `return_to_home(req)`          | Trigger RTH                              |
-| `look_at(req)`                 | Point camera at coordinate               |
-| `manual_control(req)`          | Send a single manual-control input       |
-| `manual_control_session(...)`  | Open a streaming manual-control session  |
-| `dock_operation(req)`          | Open / close / lock / unlock dock        |
-| `boot_sub_asset(req)`          | Power on a payload sub-asset             |
-| `change_ac_mode(req)`          | Change air-conditioning mode on a dock   |
-| `debug_mode(req)`              | Enter / exit debug mode                  |
+    try:
+        async with asyncio.timeout(300):
+            result = await client.commands.execute_and_wait(
+                "DOCK-1", "navigation.go_to", {"latitude": 47.7760, "longitude": 9.2671, "altitude": 60}
+            )
+    except CommandError as error:
+        print(error.category_name, error.code, error)  # e.g. ERROR_CATEGORY_INVALID_ARGUMENT command.invalid_params
+    else:
+        print(to_dict(result.result))
 
-### `client.mission_autonomy`
+    started = await client.commands.execute_command("DOCK-1", "dock.open_cover")
+    async for event in client.commands.watch_command(started.command_execution_id):
+        print(event.state, event.progress, event.message)
+```
 
-Mission, task and scheduler CRUD plus lifecycle operations.
+| Method | Purpose |
+| --- | --- |
+| `list_capabilities(asset_sn)` | The asset's `CapabilitySet`: command ids, input/output JSON schemas, risk, declared errors and events |
+| `execute_command(asset_sn, command_id, params=None, *, asset_id, target, timeout, reason, no_fly_zone_override, idempotency_key)` | Run a command; returns the `CommandResult` (`ACCEPTED`/`RUNNING` with a `command_execution_id` while underway, or the final state) |
+| `execute_and_wait(asset_sn, command_id, params=None, *, target, timeout, reason, no_fly_zone_override, idempotency_key)` | Run a command and wait for its outcome; returns the `SUCCEEDED` result. Bound the wait with `asyncio.timeout` |
+| `watch_command(command_execution_id)` | Async iterator of that run's events from now on, ending after its terminal event |
+| `watch_asset(asset_sn)` | Async iterator of every command event on the asset until you leave the loop |
+| `cancel_command(command_execution_id, reason=None)` | Cancel a run |
+| `stream_manual_control(asset_sn)` | A `ManualControlStream` for stick input on the asset (see below) |
 
-| Method                                                                      | Purpose                          |
-| --------------------------------------------------------------------------- | -------------------------------- |
-| `create_mission` / `update_mission` / `get_mission` / `delete_mission`      | Mission CRUD                     |
-| `create_task` / `update_task` / `get_task` / `delete_task`                  | Task CRUD                        |
-| `get_task_by_flight_id(flight_id)`                                          | Lookup by external flight id     |
-| `start_task(task_id)` / `stop_task(task_id)`                                | Task lifecycle                   |
-| `create_scheduler` / `update_scheduler` / `get_scheduler` / `delete_scheduler` | Scheduler CRUD                |
-| `get_all_schedulers()`                                                      | List all schedulers              |
+- A refused call, or a command rejected before it started, raises `CommandError` (`category`,
+  `category_name`, `code` such as `command.invalid_params`, `status`, `result`). From
+  `execute_command`, a command that started and failed is returned with state
+  `COMMAND_STATE_FAILED` and its `error`; `execute_and_wait` raises `CommandError` for a run that
+  ends `FAILED`, `CANCELLED` or `TIMED_OUT`, with that final `result`.
+- `execute_and_wait` watches the asset before it sends the command, so a run that finishes right
+  away is not missed, and ignores the events of other runs. A watch opened after
+  `execute_command` returns can miss the end of a fast run. Leaving the wait early (timeout,
+  cancellation) closes the watch and leaves the command running; `cancel_command` stops it.
+- `navigation.go_to` altitude is metres above the **takeoff point**. Leave a param out when you
+  have no value; never send `0` for "not given". `None` values are left out.
+- Results and events are the generated `zqnt.capability.v3` messages; `to_dict(...)` turns a result
+  payload into a plain dict.
+- `client.commands` uses the remote-control connection, credential and interceptors the client
+  already has; nothing else to set up. [`main.py`](main.py) is a runnable example.
 
-### `client.live_data`
+### Manual control
 
-Camera control and live telemetry streaming.
+Stick input goes over one stream per asset. Put the asset in manual control first, then send
+inputs (roll, pitch, yaw, throttle from -1 to 1) at your control rate:
 
-| Method                            | Purpose                                |
-| --------------------------------- | -------------------------------------- |
-| `start_live_stream(req)`          | Start live stream                      |
-| `stop_live_stream(req)`           | Stop live stream                       |
-| `change_lens(req)`                | Switch camera lens                     |
-| `change_zoom(req)`                | Set zoom factor                        |
-| `stream_telemetry(asset_sn, ...)` | Async iterator of telemetry responses  |
+```python
+await client.commands.execute_and_wait("DRONE-1", "flight.manual.enter")
+async with client.commands.stream_manual_control("DRONE-1") as stick:
+    await stick.send(pitch=0.2, throttle=0.5)
+    await stick.send(throttle=0.5, gimbal_pitch=-30)
+print(stick.accepted_inputs)
+await client.commands.execute_and_wait("DRONE-1", "flight.manual.exit")
+```
+
+The first input names the asset; one stream controls one asset. Leaving the block normally ends
+the session and waits for the platform's answer: `accepted_inputs` is the number of inputs passed
+on to the asset (`await stick.close()` returns it too). Leaving it with an exception aborts the
+stream. `send` and `close` raise `CommandError` when the platform refused the session (no adapter
+reachable, an asset of another organization) or the adapter dropped it.
+
+### Telemetry, detections and alerts
+
+```python
+from zqnt_api.generated.zqnt.telemetry.v3 import telemetry_pb2
+
+async for item in client.telemetry.watch_telemetry(["DOCK-1"], min_interval=1.0):
+    if isinstance(item, telemetry_pb2.TelemetrySample):
+        print(item.asset.sn, item.position, item.battery_percent, to_dict(item.details))
+    else:
+        print(item.asset.sn, telemetry_pb2.SourceState.Name(item.state))
+```
+
+`watch_telemetry(asset_sns=None, *, min_interval=None, heartbeat_timeout=35s)` streams
+`TelemetrySample`s from the live-data service: the shared fields (position, relative altitude,
+heading, speeds, battery) and the device-specific `details` under the keys of the capabilities'
+`telemetry_fields`. No asset watches every asset of the caller's organization; a dock's serial
+includes its drone. `min_interval` keeps at most one sample per asset per interval. A
+`SourceStatus` comes first for every watched asset, then on each change to online, stale or no
+data. The platform sends heartbeats on a quiet stream; when neither a sample nor a heartbeat
+arrives within `heartbeat_timeout`, the loop raises a retryable `CommandError` (`SERVICE`). A
+watch does not reconnect: watch again.
+
+```python
+async for batch in client.telemetry.watch_detections(["DRONE-1"]):
+    print(batch.asset.sn, batch.stream_url, len(batch.detections))
+
+async for alert in client.telemetry.watch_alerts(min_severity=telemetry_pb2.ALERT_SEVERITY_WARNING):
+    print(alert.asset.sn, telemetry_pb2.AlertSeverity.Name(alert.severity), alert.code, alert.message)
+```
+
+`watch_detections(asset_sns=None, *, heartbeat_timeout=35s)` yields `DetectionBatch`es,
+`watch_alerts(asset_sns=None, *, min_severity=ALERT_SEVERITY_UNSPECIFIED, heartbeat_timeout=35s)`
+yields `Alert`s (stable `code` such as `dock.rain`, `message`, `details`) of at least
+`min_severity`. Heartbeats, refusals and a dropped stream behave as for `watch_telemetry`.
+
+**Upgrading from 2.x:** the typed per-command methods (`client.remote_control`) and the 2.x live
+data client (`client.live_data`) are removed in 3.0. [MIGRATION.md](MIGRATION.md) maps every typed
+call to its command id and params.
 
 ---
 
-## Streaming
+## Mission autonomy and connector
 
-Server-streaming RPCs return an async iterator. Cancellation happens automatically
-when you `break` out of the loop or the surrounding `async with` exits.
-
-```python
-async with ZequentClient.from_env() as client:
-    async for tel in client.live_data.stream_telemetry(asset_sn="DOCK-1"):
-        if tel.battery_percentage < 20:
-            break
-```
-
-Bi-directional manual control:
-
-```python
-async with client.remote_control.manual_control_session(sn="DOCK-1") as session:
-    await session.send(ManualControlInput(throttle=0.5, yaw=0.1))
-    response = await session.recv()
-```
+`client.mission_autonomy` manages Applications (upsert, get, list, delete, environments, promote a
+version), runs them (`execute_application`, `execute_skill`, `execute_simple`, the
+`create_*_execution` variants), drives a run (`start_`, `pause_`, `resume_`, `cancel_`,
+`signal_skill_execution`), reads runs (`get_skill_execution`, `list_skill_executions`) and
+schedulers. `client.connector` reads and registers assets, sub-assets and payloads, organizations,
+policies, technical configs, the skill registry and schedulers, and `asset_monitoring(sn, on_data)`
+streams asset monitoring updates (a `StreamHandle`; `await handle.stop()`).
 
 ---
 
@@ -201,16 +253,21 @@ header they set wins, and the fixed client token is then not sent.
 All client errors derive from `ZequentClientError`:
 
 ```python
-from client_sdk import ZequentClientError, ZequentRetryExhaustedError
+from client_sdk import CommandError, ZequentClientError
 
 try:
-    await client.remote_control.takeoff(TakeoffRequest(sn="DOCK-1"))
-except ZequentRetryExhaustedError as e:
-    # Retries exhausted across the configured policy
-    print("retries gave up:", e)
+    await client.commands.execute_command("DOCK-1", "flight.takeoff", {"altitude": 40})
+except CommandError as e:
+    # Refused or rejected: e.category_name, e.code, e.status, e.retryable
+    print("command error:", e.code, e)
 except ZequentClientError as e:
     print("client error:", e)
 ```
+
+`client.commands` and `client.telemetry` raise `CommandError` for every refusal, including
+exhausted retries (`retryable=True`) and authentication (`ERROR_CATEGORY_PERMISSION_DENIED`).
+`client.connector` and `client.mission_autonomy` raise `ZequentRetryExhaustedError` when retries
+give up.
 
 The SDK also exposes `CircuitBreakerOpen` (in `client_sdk.grpc_.resilience`)
 raised when the per-method breaker is open.
@@ -223,16 +280,16 @@ Unary RPCs are wrapped with retry + circuit-breaker policies. Defaults are sane;
 override them via `ResilienceConfig`:
 
 ```python
-from client_sdk.config import ZequentClientConfig
+from client_sdk import ZequentClient
 from client_sdk.config.resilience import ResilienceConfig
 
-config = ZequentClientConfig.from_env()
-config.resilience = ResilienceConfig(
-    max_attempts=5,
-    initial_backoff_ms=200,
-    max_backoff_ms=5_000,
-    breaker_failure_threshold=10,
-    breaker_reset_seconds=30,
+client = ZequentClient.from_env(
+    resilience=ResilienceConfig(
+        max_retry_attempts=5,
+        retry_delay_millis=200,
+        circuit_breaker_failure_threshold=10,
+        circuit_breaker_wait_duration_millis=30_000,
+    )
 )
 ```
 
@@ -245,12 +302,13 @@ level when needed.
 
 ```
 ZequentClient
- |- RemoteControlClient   -> remote_control_pb2_grpc.RemoteControlServiceStub
- |- MissionAutonomyClient -> mission_autonomy_pb2_grpc.MissionAutonomyServiceStub
- |- LiveDataClient        -> live_data_pb2_grpc.LiveDataServiceStub
+ |- CommandsClient        -> zqnt.control.v3 RemoteControlService (remote-control channel)
+ |- TelemetryClient       -> zqnt.telemetry.v3 TelemetryService (live-data channel)
+ |- ConnectorClient       -> ConnectorService (connector channel)
+ |- MissionAutonomyClient -> MissionAutonomyService (mission-autonomy channel)
 ```
 
-Each sub-client owns an `aio` gRPC channel that is closed when the parent
+Each channel that is closed when the parent
 `ZequentClient` exits its `async with` block.
 
 ---
