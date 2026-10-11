@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from zqnt_utils.generated.zqnt import common_pb2
+from zqnt_api.generated.zqnt import common_pb2
 
 from client_sdk.config.resilience import ResilienceConfig
 from client_sdk.models import (
@@ -79,6 +79,25 @@ def client_with_fake_stub():
         return rc, stub
 
     return _factory
+
+
+# ---------------------------------------------------------------------------
+# Deprecation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_typed_call_points_at_its_command_id(client_with_fake_stub) -> None:
+    rc, _ = client_with_fake_stub()
+    with pytest.warns(DeprecationWarning, match='"dock.open_cover"'):
+        await rc.open_cover(DockOperationRequest(sn="DOCK-001"))
+
+
+@pytest.mark.asyncio
+async def test_the_manual_input_session_points_at_the_v3_stream(client_with_fake_stub) -> None:
+    rc, _ = client_with_fake_stub()
+    with pytest.warns(DeprecationWarning, match="stream_manual_control"):
+        rc.start_manual_control_input("DOCK-001")
 
 
 # ---------------------------------------------------------------------------

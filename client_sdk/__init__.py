@@ -4,7 +4,10 @@ ZQNT Python Client SDK
 
 Python client for the Zequent Framework. Connects to:
 
-  * RemoteControlService     (flight ops, manual control, dock & asset ops)
+  * zqnt.control.v3.RemoteControlService (any command by id: list_capabilities, execute_command,
+    stream_manual_control)
+  * zqnt.telemetry.v3.TelemetryService (watch_telemetry)
+  * RemoteControlService     (2.x typed flight, dock & asset ops; deprecated on 3.0)
   * MissionAutonomyService   (mission / task / scheduler CRUD + start/stop)
   * LiveDataService          (telemetry streaming, live stream, camera control)
 
@@ -21,19 +24,21 @@ Quick-start
        from client_sdk import ZequentClient
 
        async with ZequentClient.from_env() as client:
-           resp = await client.remote_control.takeoff(...)
+           result = await client.commands.execute_command("DRONE-1", "flight.takeoff", {"altitude": 40})
 """
 
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _pkg_version
 
+from .commands import CommandError, CommandsClient, ManualControlStream
 from .exceptions import ZequentClientError, ZequentRetryExhaustedError
 from .live_data.stream_handle import StreamHandle
+from .telemetry import TelemetryClient
 
 try:
     __version__ = _pkg_version("zqnt-client-sdk")
 except PackageNotFoundError:
-    __version__ = "1.0.1"
+    __version__ = "3.0.0"
 
 from .models import (
     AssetSdrState,
@@ -77,6 +82,10 @@ from .zequent_client import ZequentClient
 __all__ = [
     "__version__",
     "ZequentClient",
+    "CommandsClient",
+    "CommandError",
+    "ManualControlStream",
+    "TelemetryClient",
     "StreamHandle",
     "ManualControlInputSession",
     # core responses
